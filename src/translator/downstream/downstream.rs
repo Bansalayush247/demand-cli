@@ -28,7 +28,7 @@ use roles_logic_sv2::{
     utils::Mutex,
 };
 
-use std::{collections::VecDeque, net::IpAddr, sync::Arc};
+use std::{collections::VecDeque, net::{IpAddr, SocketAddr}, sync::Arc};
 use sv1_api::{
     client_to_server, json_rpc, server_to_client,
     utils::{Extranonce, HexU32Be},
@@ -113,6 +113,8 @@ pub struct Downstream {
     pub last_call_to_update_hr: u128,
     pub(super) recent_notifies: VecDeque<server_to_client::Notify<'static>>,
     pub(super) stats_sender: StatsSender,
+    pub assigned_pool: Option<SocketAddr>, // ADD THIS FIELD
+
 }
 
 impl Downstream {
@@ -132,6 +134,8 @@ impl Downstream {
         task_manager: Arc<Mutex<TaskManager>>,
         initial_difficulty: f32,
         stats_sender: StatsSender,
+        router: Arc<crate::router::Router>, // ADD THIS PARAMETER
+
     ) {
         assert!(last_notify.is_some());
 
@@ -181,7 +185,10 @@ impl Downstream {
         if let Some(notify) = last_notify.clone() {
             recent_notifies.push_back(notify);
         }
-
+let assigned_pool = router.assign_miner_to_pool().await;
+        if let Some(pool_addr) = assigned_pool {
+            info!("New miner (ID: {}) assigned to pool {}", connection_id, pool_addr);
+        }
         let downstream = Arc::new(Mutex::new(Downstream {
             connection_id,
             authorized_names: vec![],
@@ -197,6 +204,7 @@ impl Downstream {
             last_call_to_update_hr: 0,
             recent_notifies: recent_notifies.clone(),
             stats_sender,
+            assigned_pool: assigned_pool.clone(), // ADD THIS LINE
         }));
 
         if let Err(e) = start_receive_downstream(
@@ -231,6 +239,7 @@ impl Downstream {
             recent_notifies,
             host.clone(),
             connection_id,
+            router.clone(), // ADD THIS LINE
         )
         .await
         {
@@ -248,6 +257,7 @@ impl Downstream {
         upstream_difficulty_config: Arc<Mutex<UpstreamDifficultyConfig>>,
         downstreams: Receiver<(Sender<String>, Receiver<String>, IpAddr)>,
         stats_sender: StatsSender,
+        router: Arc<crate::router::Router>,
     ) -> Result<AbortOnDrop, Error<'static>> {
         let task_manager = TaskManager::initialize();
         let abortable = task_manager
@@ -262,6 +272,7 @@ impl Downstream {
             upstream_difficulty_config,
             downstreams,
             stats_sender,
+            router,
         )
         .await
         {
@@ -356,6 +367,7 @@ impl Downstream {
         difficulty_mgmt: DownstreamDifficultyConfig,
         upstream_difficulty_config: Arc<Mutex<UpstreamDifficultyConfig>>,
         stats_sender: StatsSender,
+        assigned_pool: Option<SocketAddr>,
     ) -> Self {
         Downstream {
             connection_id,
@@ -372,6 +384,8 @@ impl Downstream {
             last_call_to_update_hr: 0,
             recent_notifies: VecDeque::with_capacity(2),
             stats_sender,
+            assigned_pool,
+
         }
     }
 }

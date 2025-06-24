@@ -2,10 +2,12 @@
 use jemallocator::Jemalloc;
 use router::Router;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
+use clap::Parser;
 #[cfg(not(target_os = "windows"))]
 #[global_allocator]
 static GLOBAL: Jemalloc = Jemalloc;
 
+use std::sync::Arc;
 use crate::shared::utils::AbortOnDrop;
 use config::Configuration;
 use key_utils::Secp256k1PublicKey;
@@ -63,6 +65,7 @@ lazy_static! {
 
 #[tokio::main]
 async fn main() {
+    let _arg=config::Args::parse();
     let log_level = Configuration::loglevel();
     let noise_connection_log_level = Configuration::nc_loglevel();
 
@@ -80,12 +83,12 @@ async fn main() {
     Configuration::token().expect("TOKEN is not set");
 
     //`self_update` performs synchronous I/O so spawn_blocking is needed
-    if Configuration::auto_update() {
-        if let Err(e) = tokio::task::spawn_blocking(check_update_proxy).await {
-            error!("An error occured while trying to update Proxy; {:?}", e);
-            ProxyState::update_inconsistency(Some(1));
-        };
-    }
+    // if Configuration::auto_update() {
+    //     if let Err(e) = tokio::task::spawn_blocking(check_update_proxy).await {
+    //         error!("An error occured while trying to update Proxy; {:?}", e);
+    //         ProxyState::update_inconsistency(Some(1));
+    //     };
+    // }
 
     if Configuration::test() {
         info!("Connecting to test endpoint...");
@@ -105,48 +108,68 @@ async fn main() {
 
     let mut router = router::Router::new(pool_addresses, auth_pub_k, None, None);
     let epsilon = Duration::from_millis(30_000);
-    let best_upstream = router.select_pool_connect().await;
-    initialize_proxy(&mut router, best_upstream, epsilon).await;
+    //let best_upstream = router.select_pool_connect().await;
+    initialize_proxy(&mut router, epsilon).await;
     info!("exiting");
     tokio::time::sleep(tokio::time::Duration::from_secs(60)).await;
 }
 
 async fn initialize_proxy(
     router: &mut Router,
-    mut pool_addr: Option<std::net::SocketAddr>,
     epsilon: Duration,
 ) {
     loop {
-        // Initial setup for the proxy
         let stats_sender = api::stats::StatsSender::new();
+        let pool_configs = Configuration::pool_configs();
+        let is_multi_upstream = pool_configs.is_some();
 
-        let (send_to_pool, recv_from_pool, pool_connection_abortable) =
-            match router.connect_pool(pool_addr).await {
-                Ok(connection) => connection,
-                Err(_) => {
-                    error!("No upstream available. Retrying...");
-                    warn!("Are you using the correct TOKEN??");
-                    let mut secs = 10;
-                    while secs > 0 {
-                        tracing::warn!("Retrying in {} seconds...", secs);
-                        tokio::time::sleep(Duration::from_secs(1)).await;
-                        secs -= 1;
-                    }
-                    // Restart loop, esentially restarting proxy
-                    continue;
+        let pool_connections = if is_multi_upstream {
+            router.connect_all_pools().await
+        } else {
+            let pool_addr = router
+                .select_pool_connect()
+                .await
+                .expect("No valid pool available");
+            vec![(0 as usize, pool_addr, Ok(router.clone().connect_pool(Some(pool_addr)).await.unwrap()))]
+        };
+
+        // Handle connection results
+        let mut successful_connections = Vec::new();
+        for (pool_id, pool_addr, result) in pool_connections {
+            match result {
+                Ok((send_to_pool, recv_from_pool, pool_connection_abortable)) => {
+                    info!("Successfully connected to pool {} (ID: {})", pool_addr, pool_id);
+                    successful_connections.push((pool_id, pool_addr, send_to_pool, recv_from_pool, pool_connection_abortable));
                 }
-            };
+                Err(e) => {
+                    error!("Failed to connect to pool {} (ID: {}): {:?}", pool_addr, pool_id, e);
+                }
+            }
+        }
+
+        if successful_connections.is_empty() {
+            error!("No upstream available. Retrying...");
+            warn!("Are you using the correct TOKEN??");
+            let mut secs = 10;
+            while secs > 0 {
+                tracing::warn!("Retrying in {} seconds...", secs);
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                secs -= 1;
+            }
+            continue;
+        }
+
+        // Use the first successful connection for the main flow (backward compatibility)
+        let (_, _, send_to_pool, recv_from_pool, pool_connection_abortable) = successful_connections.into_iter().next().unwrap();
 
         let (downs_sv1_tx, downs_sv1_rx) = channel(10);
         let sv1_ingress_abortable = ingress::sv1_ingress::start_listen_for_downstream(downs_sv1_tx);
 
         let (translator_up_tx, mut translator_up_rx) = channel(10);
         let translator_abortable =
-            match translator::start(downs_sv1_rx, translator_up_tx, stats_sender.clone()).await {
-                Ok(abortable) => abortable,
+match translator::start(downs_sv1_rx, translator_up_tx, stats_sender.clone(), Arc::new(router.clone())).await {          Ok(abortable) => abortable,
                 Err(e) => {
                     error!("Impossible to initialize translator: {e}");
-                    // Impossible to start the proxy so we restart proxy
                     ProxyState::update_translator_state(TranslatorState::Down);
                     ProxyState::update_tp_state(TpState::Down);
                     return;
@@ -228,12 +251,10 @@ async fn initialize_proxy(
         match monitor(router, abort_handles, epsilon, server_handle).await {
             Reconnect::NewUpstream(new_pool_addr) => {
                 ProxyState::update_proxy_state_up();
-                pool_addr = Some(new_pool_addr);
                 continue;
             }
             Reconnect::NoUpstream => {
                 ProxyState::update_proxy_state_up();
-                pool_addr = None;
                 continue;
             }
         };

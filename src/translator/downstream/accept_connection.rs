@@ -24,6 +24,8 @@ pub async fn start_accept_connection(
     upstream_difficulty_config: Arc<Mutex<UpstreamDifficultyConfig>>,
     mut downstreams: Receiver<(Sender<String>, Receiver<String>, IpAddr)>,
     stats_sender: crate::api::stats::StatsSender,
+    router: Arc<crate::router::Router>, // ADD THIS PARAMETER
+
 ) -> Result<(), Error<'static>> {
     let handle = {
         let task_manager = task_manager.clone();
@@ -80,6 +82,8 @@ pub async fn start_accept_connection(
                             task_manager.clone(),
                             initial_difficulty,
                             stats_sender.clone(),
+                            router.clone(), // ADD THIS LINE
+
                         )
                         .await
                     }

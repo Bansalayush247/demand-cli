@@ -61,13 +61,31 @@ impl Downstream {
     /// aggregated channel hashrate.
     pub fn remove_downstream_hashrate_from_channel(
         self_: &Arc<Mutex<Self>>,
+        router: Option<Arc<crate::router::Router>>, // ADD THIS PARAMETER
     ) -> ProxyResult<'static, ()> {
-        let (upstream_diff, estimated_downstream_hash_rate) = self_.safe_lock(|d| {
+        let (upstream_diff, estimated_downstream_hash_rate, assigned_pool, connection_id) = self_.safe_lock(|d| {
             (
                 d.upstream_difficulty_config.clone(),
                 d.difficulty_mgmt.estimated_downstream_hash_rate,
+                d.assigned_pool,
+                d.connection_id, // ADD THIS
             )
         })?;
+
+        // ADD THIS: Remove miner from pool assignment when they disconnect
+        if let Some(router) = router {
+            if let Some(pool_addr) = assigned_pool {
+                tokio::spawn(async move {
+                    router.remove_miner_from_pool(pool_addr).await;
+                });
+                info!("✅ REMOVED: Miner {} disconnected from pool {}", connection_id, pool_addr);
+            } else {
+                info!("⚠️ DISCONNECT: Miner {} had no assigned pool", connection_id);
+            }
+        } else {
+            info!("⚠️ DISCONNECT: No router provided for miner {} disconnect", connection_id);
+        }
+
         info!(
             "Removing downstream hashrate from channel upstream_diff: {:?}, downstream_diff: {:?}",
             upstream_diff, estimated_downstream_hash_rate
@@ -453,6 +471,7 @@ mod test {
             downstream_conf.clone(),
             Arc::new(Mutex::new(upstream_config)),
             crate::api::stats::StatsSender::new(),
+            None,
         );
         downstream.difficulty_mgmt.estimated_downstream_hash_rate = start_hashrate as f32;
 
