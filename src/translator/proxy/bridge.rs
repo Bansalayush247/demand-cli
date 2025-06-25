@@ -326,7 +326,10 @@ impl Bridge {
                 }
             }
             Err(roles_logic_sv2::Error::ShareDoNotMatchAnyJob) => {
-                warn!("Channel factory can not get this share's job_id: {}", job_id);
+                warn!(
+                    "Channel factory can not get this share's job_id: {}",
+                    job_id
+                );
             }
             Err(e) => {
                 return Err(Error::RolesSv2Logic(e));

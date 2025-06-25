@@ -5,14 +5,14 @@ use std::{
     net::{SocketAddr, ToSocketAddrs},
     path::PathBuf,
 };
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::{HashUnit, DEFAULT_SV1_HASHPOWER};
 lazy_static! {
     pub static ref CONFIG: Configuration = Configuration::load_config();
 }
 #[derive(Parser)]
-pub struct Args {
+struct Args {
     #[clap(long)]
     test: bool,
     #[clap(long = "d", short = 'd', value_parser = parse_hashrate)]
@@ -47,13 +47,12 @@ pub struct Args {
     auto_update: bool,
     #[clap(long = "hashrate-dist", value_delimiter = ',')]
     hashrate_distribution: Option<Vec<f32>>,
-
 }
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct PoolConfig {
     pub address: SocketAddr,
-    pub weight: f32, 
+    pub weight: f32,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -62,7 +61,7 @@ struct ConfigFile {
     tp_address: Option<String>,
     pool_addresses: Option<Vec<String>>,
     test_pool_addresses: Option<Vec<String>>,
-    hashrate_distribution: Option<Vec<f32>>, // Add this
+    hashrate_distribution: Option<Vec<f32>>,
     interval: Option<u64>,
     delay: Option<u64>,
     downstream_hashrate: Option<String>,
@@ -81,7 +80,7 @@ pub struct Configuration {
     tp_address: Option<String>,
     pool_addresses: Option<Vec<SocketAddr>>,
     test_pool_addresses: Option<Vec<SocketAddr>>,
-    hashrate_distribution: Option<Vec<f32>>, // Add this
+    hashrate_distribution: Option<Vec<f32>>,
     interval: u64,
     delay: u64,
     downstream_hashrate: f32,
@@ -109,16 +108,6 @@ impl Configuration {
         } else {
             CONFIG.pool_addresses.clone()
         }
-    }
-
-    pub fn test_pool_address() -> Option<Vec<SocketAddr>> {
-        let result = CONFIG.test_pool_addresses.clone();
-        if result.is_some() {
-            info!("Test pool addresses loaded: {:?}", result);
-        } else {
-            warn!("No test pool addresses found in configuration");
-        }
-        result
     }
 
     pub fn adjustment_interval() -> u64 {
@@ -187,19 +176,10 @@ impl Configuration {
     }
 
     pub fn pool_configs() -> Option<Vec<PoolConfig>> {
-
-        info!("=== pool_configs() called ===");
         let hashrate_dist = Self::hashrate_distribution();
-        info!("Hashrate distribution: {:?}", hashrate_dist);
         if let Some(distribution) = hashrate_dist {
             // Get pool addresses (considering test addresses)
-            let addresses = if Configuration::test() {
-                Self::test_pool_address().unwrap_or_else(|| {
-                    Self::pool_address().unwrap_or_default()
-                })
-            } else {
-                Self::pool_address().unwrap_or_default()
-            };
+            let addresses = Self::pool_address().unwrap_or_default();
 
             if addresses.is_empty() {
                 warn!("No pool addresses provided for hashrate distribution");
@@ -255,7 +235,7 @@ impl Configuration {
             }
         } else {
             for pool in &mut pools {
-                pool.weight = pool.weight / total_weight;
+                pool.weight /= total_weight;
             }
         }
         pools
@@ -291,6 +271,7 @@ impl Configuration {
             .token
             .or(config.token)
             .or_else(|| std::env::var("TOKEN").ok());
+        debug!("User Token: {:?}", token);
 
         let tp_address = args
             .tp_address
@@ -424,10 +405,8 @@ impl Configuration {
         let auto_update = args.auto_update
             || config.auto_update.unwrap_or(true)
             || std::env::var("AUTO_UPDATE").is_ok();
-          // Add hashrate distribution parsing
-    let hashrate_distribution = args.hashrate_distribution
-        .or(config.hashrate_distribution);
 
+        let hashrate_distribution = args.hashrate_distribution.or(config.hashrate_distribution);
 
         Configuration {
             token,

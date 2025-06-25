@@ -15,6 +15,7 @@ pub async fn start_receive_downstream(
     downstream: Arc<Mutex<Downstream>>,
     mut recv_from_down: mpsc::Receiver<String>,
     connection_id: u32,
+    router: Arc<crate::router::Router>,
 ) -> Result<(), Error<'static>> {
     let handle = task::spawn(async move {
         while let Some(incoming) = recv_from_down.recv().await {
@@ -52,6 +53,12 @@ pub async fn start_receive_downstream(
         warn!(
             "Downstream: Shutting down sv1 downstream reader {}",
             connection_id
+        );
+
+        // Call disconnect handler with router
+        let _ = super::downstream::Downstream::remove_downstream_hashrate_from_channel(
+            &downstream,
+            Some(router),
         );
     });
     TaskManager::add_receive_downstream(task_manager, handle.into())

@@ -54,10 +54,10 @@ impl Router {
     ) -> Self {
         let (latency_tx, latency_rx) = watch::channel(None);
         info!("Router::new - pool_addresses: {:?}", pool_addresses);
-        
+
         let pool_configs = Configuration::pool_configs();
         info!("Router::new - pool_configs: {:?}", pool_configs);
-        
+
         let weighted_dist = if let Some(ref configs) = pool_configs {
             Arc::new(Mutex::new(vec![0; configs.len()]))
         } else {
@@ -78,55 +78,63 @@ impl Router {
     }
 
     pub fn is_multi_upstream(&self) -> bool {
-        self.pool_configs.as_ref().map_or(false, |configs| configs.len() > 1)
+        self.pool_configs
+            .as_ref()
+            .is_some_and(|configs| configs.len() > 1)
     }
 
     pub async fn assign_miner_to_pool(&self) -> Option<SocketAddr> {
         if self.is_multi_upstream() {
             if let Some(configs) = &self.pool_configs {
                 let mut assignments = self.weighted_dist.lock().unwrap();
-                
+
                 // Calculate total miners
                 let total_miners: u32 = assignments.iter().sum();
-                
+
                 // Find most under-represented pool
                 let mut best_pool_id = 0;
                 let mut best_difference = f32::NEG_INFINITY;
-                
+
                 for (pool_id, config) in configs.iter().enumerate() {
                     let current_count = assignments[pool_id];
-                    let current_ratio = if total_miners == 0 { 0.0 } else { current_count as f32 / total_miners as f32 };
+                    let current_ratio = if total_miners == 0 {
+                        0.0
+                    } else {
+                        current_count as f32 / total_miners as f32
+                    };
                     let target_ratio = config.weight;
                     let difference = target_ratio - current_ratio;
-                    
-                    info!("Pool {}: {}/{} miners ({:.1}%, target: {:.1}%, diff: {:.1}%)", 
-                        pool_id, current_count, total_miners, 
-                        current_ratio * 100.0, target_ratio * 100.0, difference * 100.0);
-                    
+
                     if difference > best_difference {
                         best_difference = difference;
                         best_pool_id = pool_id;
                     }
                 }
-                
+
                 // Assign to most under-represented pool
                 assignments[best_pool_id] += 1;
                 let total_after = total_miners + 1;
-                
                 let selected_pool = configs[best_pool_id].address;
-                info!("DYNAMIC ASSIGNMENT: Miner {} → Pool {} ({}) for {:.1}% balance", 
-                    total_after, best_pool_id, selected_pool, best_difference * 100.0);
-                
+
+                info!(
+                    "✅ Miner {} → Pool {} ({}) [{}/{}]",
+                    total_after,
+                    best_pool_id,
+                    selected_pool,
+                    assignments[best_pool_id],
+                    total_after
+                );
+
                 Some(selected_pool)
             } else {
                 // Fallback to existing logic
-                self.current_pool.or_else(|| {
-                    self.pool_addresses.first().copied()
-                })
+                self.current_pool
+                    .or_else(|| self.pool_addresses.first().copied())
             }
         } else {
             // Single pool fallback
-            self.current_pool.or_else(|| self.pool_addresses.first().copied())
+            self.current_pool
+                .or_else(|| self.pool_addresses.first().copied())
         }
     }
 
@@ -149,13 +157,23 @@ impl Router {
 
     /// Select the best pool for connection
     pub async fn select_pool_connect(&self) -> Option<SocketAddr> {
-        info!("Selecting the best upstream ");
+        info!("Selecting best Pool for connection");
+        if self.pool_addresses.is_empty() {
+            error!("No pool addresses provided");
+            return None;
+        }
+        if self.pool_addresses.len() == 1 {
+            info!(
+                "Only one pool address available, using: {:?}",
+                self.pool_addresses[0]
+            );
+            return Some(self.pool_addresses[0]);
+        }
         if let Some((pool, latency)) = self.select_pool().await {
             info!("Latency for upstream {:?} is {:?}", pool, latency);
             self.latency_tx.send_replace(Some(latency)); // update latency
             Some(pool)
         } else {
-            //info!("No available pool");
             None
         }
     }
@@ -319,11 +337,27 @@ impl Router {
     }
 
     /// Connect to all configured pools
-    pub async fn connect_all_pools(&self) -> Vec<(usize, SocketAddr, Result<(tokio::sync::mpsc::Sender<PoolExtMessages<'static>>, tokio::sync::mpsc::Receiver<PoolExtMessages<'static>>, crate::shared::utils::AbortOnDrop), crate::minin_pool_connection::errors::Error>)> {
+    pub async fn connect_all_pools(
+        &self,
+    ) -> Vec<(
+        usize,
+        SocketAddr,
+        Result<
+            (
+                tokio::sync::mpsc::Sender<PoolExtMessages<'static>>,
+                tokio::sync::mpsc::Receiver<PoolExtMessages<'static>>,
+                crate::shared::utils::AbortOnDrop,
+            ),
+            crate::minin_pool_connection::errors::Error,
+        >,
+    )> {
         if let Some(configs) = &self.pool_configs {
             let mut connections = Vec::new();
             for (id, config) in configs.iter().enumerate() {
-                info!("Connecting to pool {} with weight {}", config.address, config.weight);
+                info!(
+                    "Connecting to pool {} with weight {}",
+                    config.address, config.weight
+                );
                 let result = self.clone().connect_pool(Some(config.address)).await;
                 connections.push((id, config.address, result));
             }
@@ -341,7 +375,10 @@ impl Router {
                 if assignments[pool_id] > 0 {
                     assignments[pool_id] -= 1;
                     let total: u32 = assignments.iter().sum();
-                    info!("Miner disconnected from Pool {}. New: {}/{} total", pool_id, assignments[pool_id], total);
+                    info!(
+                        "Miner disconnected from Pool {}. New: {}/{} total",
+                        pool_id, assignments[pool_id], total
+                    );
                 }
             }
         }

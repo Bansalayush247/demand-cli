@@ -61,38 +61,38 @@ impl Downstream {
     /// aggregated channel hashrate.
     pub fn remove_downstream_hashrate_from_channel(
         self_: &Arc<Mutex<Self>>,
-        router: Option<Arc<crate::router::Router>>, // ADD THIS PARAMETER
+        router: Option<Arc<crate::router::Router>>,
     ) -> ProxyResult<'static, ()> {
-        let (upstream_diff, estimated_downstream_hash_rate, assigned_pool, connection_id) = self_.safe_lock(|d| {
-            (
-                d.upstream_difficulty_config.clone(),
-                d.difficulty_mgmt.estimated_downstream_hash_rate,
-                d.assigned_pool,
-                d.connection_id, // ADD THIS
-            )
-        })?;
+        let (upstream_diff, estimated_downstream_hash_rate, assigned_pool, connection_id) =
+            self_.safe_lock(|d| {
+                (
+                    d.upstream_difficulty_config.clone(),
+                    d.difficulty_mgmt.estimated_downstream_hash_rate,
+                    d.assigned_pool,
+                    d.connection_id,
+                )
+            })?;
+        info!(
+            "Removing downstream hashrate from channel upstream_diff: {:?}, downstream_diff: {:?}",
+            upstream_diff, estimated_downstream_hash_rate
+        );
 
-        // ADD THIS: Remove miner from pool assignment when they disconnect
+        // Remove miner from pool assignment when they disconnect
         if let Some(router) = router {
             if let Some(pool_addr) = assigned_pool {
                 tokio::spawn(async move {
                     router.remove_miner_from_pool(pool_addr).await;
                 });
-                info!("✅ REMOVED: Miner {} disconnected from pool {}", connection_id, pool_addr);
-            } else {
-                info!("⚠️ DISCONNECT: Miner {} had no assigned pool", connection_id);
+                info!(
+                    "✅ REMOVED: Miner {} disconnected from pool {}",
+                    connection_id, pool_addr
+                );
             }
-        } else {
-            info!("⚠️ DISCONNECT: No router provided for miner {} disconnect", connection_id);
         }
 
-        info!(
-            "Removing downstream hashrate from channel upstream_diff: {:?}, downstream_diff: {:?}",
-            upstream_diff, estimated_downstream_hash_rate
-        );
         upstream_diff.safe_lock(|u| {
             u.channel_nominal_hashrate -=
-                // Make sure that upstream channel hasrate never goes below 0
+                // Make sure that upstream channel hashrate never goes below 0
                 f32::min(estimated_downstream_hash_rate, u.channel_nominal_hashrate);
         })?;
         Ok(())

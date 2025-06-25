@@ -25,7 +25,7 @@ pub async fn start_notify(
     recent_notifies: std::collections::VecDeque<server_to_client::Notify<'static>>,
     host: String,
     connection_id: u32,
-    router: Arc<crate::router::Router>, // ADD THIS PARAMETER
+    router: Arc<crate::router::Router>,
 ) -> Result<(), Error<'static>> {
     let handle = {
         let task_manager = task_manager.clone();
@@ -140,8 +140,8 @@ pub async fn start_notify(
                 }
             }
             // TODO here we want to be sure that on drop this is called
-let _ = Downstream::remove_downstream_hashrate_from_channel(&downstream, Some(router));           
-             warn!(
+            let _ = Downstream::remove_downstream_hashrate_from_channel(&downstream, Some(router));
+            warn!(
                 "Downstream: Shutting down sv1 downstream job notifier for {}",
                 &host
             );
