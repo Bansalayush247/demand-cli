@@ -471,7 +471,7 @@ mod test {
             Arc::new(Mutex::new(upstream_config)),
             crate::api::stats::StatsSender::new(),
             None,
-      );
+        );
         downstream.difficulty_mgmt.estimated_downstream_hash_rate = start_hashrate as f32;
 
         let total_run_time = std::time::Duration::from_secs(10);
