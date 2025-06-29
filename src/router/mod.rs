@@ -1,15 +1,15 @@
-use std::{
-    net::SocketAddr,
-    time::{Duration, Instant},
-};
-
 use crate::jd_client::job_declarator::{setup_connection::SetupConnectionHandler, JobDeclarator};
 use codec_sv2::{buffer_sv2::Slice, HandshakeRole};
 use demand_share_accounting_ext::parser::PoolExtMessages;
 use demand_sv2_connection::noise_connection_tokio::Connection;
 use key_utils::Secp256k1PublicKey;
 use noise_sv2::Initiator;
-use roles_logic_sv2::{common_messages_sv2::SetupConnection, parsers::Mining};
+use roles_logic_sv2::{common_messages_sv2::SetupConnection, parsers::Mining, utils::Mutex};
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::{
+    net::SocketAddr,
+    time::{Duration, Instant},
+};
 use tokio::{
     net::TcpStream,
     sync::{
@@ -24,8 +24,8 @@ use crate::{
     minin_pool_connection::{self, get_mining_setup_connection_msg, mining_setup_connection},
     shared::utils::AbortOnDrop,
 };
-
-use std::sync::{Arc, Mutex}; // Use std::sync::Mutex instead
+/// Router handles connection to Multiple upstreams.
+use std::sync::Arc;
 
 #[derive(Clone)]
 pub struct Router {
@@ -36,14 +36,14 @@ pub struct Router {
     timer: Option<Duration>,
     latency_tx: watch::Sender<Option<Duration>>,
     pub latency_rx: watch::Receiver<Option<Duration>>,
-    pool_configs: Option<Vec<PoolConfig>>,
-    pub weighted_dist: Arc<Mutex<Vec<u32>>>,
+    multi_pool_configs: Option<Vec<PoolConfig>>,
+    pub weighted_dist: Option<Arc<Vec<AtomicU32>>>,
 }
 
 impl Router {
     /// Creates a new `Router` instance with the specified upstream addresses.
     pub fn new(
-        pool_addresses: Vec<SocketAddr>, // Keep existing parameter for compatibility
+        pool_addresses: Vec<SocketAddr>,
         auth_pub_k: Secp256k1PublicKey,
         // Configuration msg used to setup connection between client and pool
         // If not, present `get_mining_setup_connection_msg()` is called to generated default values
@@ -53,15 +53,14 @@ impl Router {
         timer: Option<Duration>,
     ) -> Self {
         let (latency_tx, latency_rx) = watch::channel(None);
-        info!("Router::new - pool_addresses: {:?}", pool_addresses);
 
-        let pool_configs = Configuration::pool_configs();
-        info!("Router::new - pool_configs: {:?}", pool_configs);
-
-        let weighted_dist = if let Some(ref configs) = pool_configs {
-            Arc::new(Mutex::new(vec![0; configs.len()]))
+        let multi_pool_configs = Configuration::pool_configs();
+        let weighted_dist = if let Some(ref configs) = multi_pool_configs {
+            Some(Arc::new(
+                (0..configs.len()).map(|_| AtomicU32::new(0)).collect(),
+            ))
         } else {
-            Arc::new(Mutex::new(Vec::new()))
+            None
         };
 
         Self {
@@ -72,31 +71,28 @@ impl Router {
             timer,
             latency_tx,
             latency_rx,
-            pool_configs,
+            multi_pool_configs,
             weighted_dist,
         }
     }
 
     pub fn is_multi_upstream(&self) -> bool {
-        self.pool_configs
+        self.multi_pool_configs
             .as_ref()
             .is_some_and(|configs| configs.len() > 1)
     }
 
     pub async fn assign_miner_to_pool(&self) -> Option<SocketAddr> {
         if self.is_multi_upstream() {
-            if let Some(configs) = &self.pool_configs {
-                let mut assignments = self.weighted_dist.lock().unwrap();
+            if let Some(configs) = &self.multi_pool_configs {
+                let assignments = self.weighted_dist.as_ref().unwrap();
+                let total_miners: u32 = assignments.iter().map(|a| a.load(Ordering::Relaxed)).sum();
 
-                // Calculate total miners
-                let total_miners: u32 = assignments.iter().sum();
-
-                // Find most under-represented pool
                 let mut best_pool_id = 0;
                 let mut best_difference = f32::NEG_INFINITY;
 
                 for (pool_id, config) in configs.iter().enumerate() {
-                    let current_count = assignments[pool_id];
+                    let current_count = assignments[pool_id].load(Ordering::Relaxed);
                     let current_ratio = if total_miners == 0 {
                         0.0
                     } else {
@@ -112,17 +108,13 @@ impl Router {
                 }
 
                 // Assign to most under-represented pool
-                assignments[best_pool_id] += 1;
+                let new_count = assignments[best_pool_id].fetch_add(1, Ordering::Relaxed) + 1;
                 let total_after = total_miners + 1;
                 let selected_pool = configs[best_pool_id].address;
 
                 info!(
                     "✅ Miner {} → Pool {} ({}) [{}/{}]",
-                    total_after,
-                    best_pool_id,
-                    selected_pool,
-                    assignments[best_pool_id],
-                    total_after
+                    total_after, best_pool_id, selected_pool, new_count, total_after
                 );
 
                 Some(selected_pool)
@@ -157,7 +149,7 @@ impl Router {
 
     /// Select the best pool for connection
     pub async fn select_pool_connect(&self) -> Option<SocketAddr> {
-        info!("Selecting best Pool for connection");
+        info!("Selecting the best upstream ");
         if self.pool_addresses.is_empty() {
             error!("No pool addresses provided");
             return None;
@@ -174,11 +166,12 @@ impl Router {
             self.latency_tx.send_replace(Some(latency)); // update latency
             Some(pool)
         } else {
+            //info!("No available pool");
             None
         }
     }
 
-    /// Select the best pool for monitoring
+    /// Select the best pool for monitoringo
     async fn select_pool_monitor(&self, epsilon: Duration) -> Option<SocketAddr> {
         if let Some((best_pool, best_pool_latency)) = self.select_pool().await {
             if let Some(current_pool) = self.current_pool {
@@ -351,7 +344,7 @@ impl Router {
             crate::minin_pool_connection::errors::Error,
         >,
     )> {
-        if let Some(configs) = &self.pool_configs {
+        if let Some(configs) = &self.multi_pool_configs {
             let mut connections = Vec::new();
             for (id, config) in configs.iter().enumerate() {
                 info!(
@@ -369,15 +362,16 @@ impl Router {
 
     /// Removes a miner from the assigned pool, allowing for rebalancing
     pub async fn remove_miner_from_pool(&self, pool_address: SocketAddr) {
-        if let Some(configs) = &self.pool_configs {
+        if let Some(configs) = &self.multi_pool_configs {
             if let Some(pool_id) = configs.iter().position(|c| c.address == pool_address) {
-                let mut assignments = self.weighted_dist.lock().unwrap();
-                if assignments[pool_id] > 0 {
-                    assignments[pool_id] -= 1;
-                    let total: u32 = assignments.iter().sum();
+                let assignments = self.weighted_dist.as_ref().unwrap();
+                let old = assignments[pool_id].load(Ordering::Relaxed);
+                if old > 0 {
+                    let new = assignments[pool_id].fetch_sub(1, Ordering::Relaxed) - 1;
+                    let total: u32 = assignments.iter().map(|a| a.load(Ordering::Relaxed)).sum();
                     info!(
                         "Miner disconnected from Pool {}. New: {}/{} total",
-                        pool_id, assignments[pool_id], total
+                        pool_id, new, total
                     );
                 }
             }

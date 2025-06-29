@@ -406,7 +406,16 @@ impl Configuration {
             || config.auto_update.unwrap_or(true)
             || std::env::var("AUTO_UPDATE").is_ok();
 
-        let hashrate_distribution = args.hashrate_distribution.or(config.hashrate_distribution);
+        let hashrate_distribution = args
+            .hashrate_distribution
+            .or(config.hashrate_distribution)
+            .or_else(|| {
+                std::env::var("HASHRATE_DISTRIBUTION").ok().and_then(|s| {
+                    s.split(',')
+                        .map(|x| x.trim().parse::<f32>().ok())
+                        .collect::<Option<Vec<f32>>>()
+                })
+            });
 
         Configuration {
             token,

@@ -106,182 +106,309 @@ async fn main() {
 
     let mut router = router::Router::new(pool_addresses, auth_pub_k, None, None);
     let epsilon = Duration::from_millis(30_000);
-    //let best_upstream = router.select_pool_connect().await;
-    initialize_proxy(&mut router, epsilon).await;
+    let best_upstream = if router.is_multi_upstream() {
+        None
+    } else {
+        router.select_pool_connect().await
+    };
+
+    initialize_proxy(&mut router, best_upstream, epsilon).await;
     info!("exiting");
     tokio::time::sleep(tokio::time::Duration::from_secs(60)).await;
 }
 
 async fn initialize_proxy(
     router: &mut Router,
-    // mut pool_addr: Option<std::net::SocketAddr>,
+    mut pool_addr: Option<std::net::SocketAddr>,
     epsilon: Duration,
 ) {
     loop {
         let stats_sender = api::stats::StatsSender::new();
-        let pool_configs = Configuration::pool_configs();
-        let is_multi_upstream = pool_configs.is_some();
+        let is_multi_upstream = router.is_multi_upstream();
 
-        let pool_connections = if is_multi_upstream {
-            router.connect_all_pools().await
-        } else {
-            let pool_addr = router
-                .select_pool_connect()
-                .await
-                .expect("No valid pool available");
-            vec![(
-                0_usize,
-                pool_addr,
-                Ok(router.clone().connect_pool(Some(pool_addr)).await.unwrap()),
-            )]
-        };
+        if is_multi_upstream {
+            // Multi-upstream: connect to all pools and start components for each
+            let pool_connections = router.connect_all_pools().await;
 
-        // Handle connection results
-        let mut successful_connections = Vec::new();
-        for (pool_id, pool_addr, result) in pool_connections {
-            match result {
-                Ok((send_to_pool, recv_from_pool, pool_connection_abortable)) => {
-                    info!(
-                        "Successfully connected to pool {} (ID: {})",
-                        pool_addr, pool_id
-                    );
-                    successful_connections.push((
-                        pool_id,
-                        pool_addr,
-                        send_to_pool,
-                        recv_from_pool,
-                        pool_connection_abortable,
-                    ));
-                }
+            // Handle connection results
+            let mut any_success = false;
+            // Start translator for pool
+            let (downs_sv1_tx, downs_sv1_rx) = channel(10);
+            let sv1_ingress_abortable =
+                ingress::sv1_ingress::start_listen_for_downstream(downs_sv1_tx);
+            // Start the translator ONCE
+            let (translator_up_tx, mut translator_up_rx) = channel(10);
+            let translator_abortable = match translator::start(
+                downs_sv1_rx,
+                translator_up_tx,
+                stats_sender.clone(),
+                Arc::new(router.clone()),
+            )
+            .await
+            {
+                Ok(abortable) => abortable,
                 Err(e) => {
-                    error!(
-                        "Failed to connect to pool {} (ID: {}): {:?}",
-                        pool_addr, pool_id, e
-                    );
-                }
-            }
-        }
-
-        if successful_connections.is_empty() {
-            error!("No upstream available. Retrying...");
-            warn!("Are you using the correct TOKEN??");
-            let mut secs = 10;
-            while secs > 0 {
-                tracing::warn!("Retrying in {} seconds...", secs);
-                tokio::time::sleep(Duration::from_secs(1)).await;
-                secs -= 1;
-            }
-            continue;
-        }
-
-        // Use the first successful connection for the main flow (backward compatibility)
-        let (_, _, send_to_pool, recv_from_pool, pool_connection_abortable) =
-            successful_connections.into_iter().next().unwrap();
-
-        let (downs_sv1_tx, downs_sv1_rx) = channel(10);
-        let sv1_ingress_abortable = ingress::sv1_ingress::start_listen_for_downstream(downs_sv1_tx);
-
-        let (translator_up_tx, mut translator_up_rx) = channel(10);
-        let translator_abortable = match translator::start(
-            downs_sv1_rx,
-            translator_up_tx,
-            stats_sender.clone(),
-            Arc::new(router.clone()),
-        )
-        .await
-        {
-            Ok(abortable) => abortable,
-            Err(e) => {
-                error!("Impossible to initialize translator: {e}");
-                // Impossible to start the proxy so we restart proxy
-                ProxyState::update_translator_state(TranslatorState::Down);
-                ProxyState::update_tp_state(TpState::Down);
-                return;
-            }
-        };
-
-        let (from_jdc_to_share_accounter_send, from_jdc_to_share_accounter_recv) = channel(10);
-        let (from_share_accounter_to_jdc_send, from_share_accounter_to_jdc_recv) = channel(10);
-        let (jdc_to_translator_sender, jdc_from_translator_receiver, _) = translator_up_rx
-            .recv()
-            .await
-            .expect("Translator failed before initialization");
-
-        let jdc_abortable: Option<AbortOnDrop>;
-        let share_accounter_abortable;
-        let tp = match TP_ADDRESS.safe_lock(|tp| tp.clone()) {
-            Ok(tp) => tp,
-            Err(e) => {
-                error!("TP_ADDRESS Mutex Corrupted: {e}");
-                return;
-            }
-        };
-
-        if let Some(_tp_addr) = tp {
-            jdc_abortable = jd_client::start(
-                jdc_from_translator_receiver,
-                jdc_to_translator_sender,
-                from_share_accounter_to_jdc_recv,
-                from_jdc_to_share_accounter_send,
-            )
-            .await;
-            if jdc_abortable.is_none() {
-                ProxyState::update_tp_state(TpState::Down);
-            };
-            share_accounter_abortable = match share_accounter::start(
-                from_jdc_to_share_accounter_recv,
-                from_share_accounter_to_jdc_send,
-                recv_from_pool,
-                send_to_pool,
-            )
-            .await
-            {
-                Ok(abortable) => abortable,
-                Err(_) => {
-                    error!("Failed to start share_accounter");
+                    error!("Impossible to initialize translator: {e}");
                     return;
                 }
+            };
+
+            // Collect global abort handles ONCE
+            let mut abort_handles = vec![
+                (sv1_ingress_abortable, "sv1_ingress".to_string()),
+                (translator_abortable, "translator".to_string()),
+            ];
+
+            // For each pool, push only per-pool abort handles
+            for (pool_id, pool_addr, result) in pool_connections {
+                match result {
+                    Ok((send_to_pool, recv_from_pool, pool_connection_abortable)) => {
+                        info!(
+                            "Successfully connected to pool {} (ID: {})",
+                            pool_addr, pool_id
+                        );
+                        any_success = true;
+
+                        let (from_jdc_to_share_accounter_send, from_jdc_to_share_accounter_recv) =
+                            channel(10);
+                        let (from_share_accounter_to_jdc_send, from_share_accounter_to_jdc_recv) =
+                            channel(10);
+                        let (jdc_to_translator_sender, jdc_from_translator_receiver, _) =
+                            match translator_up_rx.recv().await {
+                                Some(val) => val,
+                                None => {
+                                    error!(
+                                        "Translator failed before initialization for pool {}",
+                                        pool_addr
+                                    );
+                                    continue;
+                                }
+                            };
+
+                        let tp = match TP_ADDRESS.safe_lock(|tp| tp.clone()) {
+                            Ok(tp) => tp,
+                            Err(e) => {
+                                error!("TP_ADDRESS Mutex Corrupted: {e}");
+                                continue;
+                            }
+                        };
+
+                        let jdc_abortable: Option<AbortOnDrop>;
+                        let share_accounter_abortable;
+                        if let Some(_tp_addr) = tp {
+                            jdc_abortable = jd_client::start(
+                                jdc_from_translator_receiver,
+                                jdc_to_translator_sender,
+                                from_share_accounter_to_jdc_recv,
+                                from_jdc_to_share_accounter_send,
+                            )
+                            .await;
+                            if jdc_abortable.is_none() {
+                                ProxyState::update_tp_state(TpState::Down);
+                            };
+                            share_accounter_abortable = match share_accounter::start(
+                                from_jdc_to_share_accounter_recv,
+                                from_share_accounter_to_jdc_send,
+                                recv_from_pool,
+                                send_to_pool.clone(),
+                            )
+                            .await
+                            {
+                                Ok(abortable) => abortable,
+                                Err(_) => {
+                                    error!(
+                                        "Failed to start share_accounter for pool {}",
+                                        pool_addr
+                                    );
+                                    continue;
+                                }
+                            }
+                        } else {
+                            jdc_abortable = None;
+                            share_accounter_abortable = match share_accounter::start(
+                                jdc_from_translator_receiver,
+                                jdc_to_translator_sender,
+                                recv_from_pool,
+                                send_to_pool.clone(),
+                            )
+                            .await
+                            {
+                                Ok(abortable) => abortable,
+                                Err(_) => {
+                                    error!(
+                                        "Failed to start share_accounter for pool {}",
+                                        pool_addr
+                                    );
+                                    continue;
+                                }
+                            };
+                        }
+
+                        // Collect abort handles for this pool
+                        abort_handles.push((
+                            pool_connection_abortable,
+                            format!("pool_connection_{}", pool_id),
+                        ));
+                      abort_handles.push((
+                            share_accounter_abortable,
+                            format!("share_accounter_{}", pool_id),
+                        ));
+                        if let Some(jdc_handle) = jdc_abortable {
+                            abort_handles.push((jdc_handle, format!("jdc_{}", pool_id)));
+                        }
+                    }
+                    Err(e) => {
+                        error!(
+                            "Failed to connect to pool {} (ID: {}): {:?}",
+                            pool_addr, pool_id, e
+                        );
+                    }
+                }
             }
+
+            if !any_success {
+                error!("No upstream available. Retrying...");
+                warn!("Are you using the correct TOKEN??");
+                let mut secs = 10;
+                while secs > 0 {
+                    tracing::warn!("Retrying in {} seconds...", secs);
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    secs -= 1;
+                }
+                continue;
+            }
+
+            let server_handle = tokio::spawn(api::start(router.clone(), stats_sender));
+            match monitor(router, abort_handles, epsilon, server_handle).await {
+                Reconnect::NewUpstream(_) | Reconnect::NoUpstream => {
+                    ProxyState::update_proxy_state_up();
+                    continue;
+                }
+            };
         } else {
-            jdc_abortable = None;
+            // Single-upstream: use the best pool passed in (or re-select if needed)
+            let (send_to_pool, recv_from_pool, pool_connection_abortable) =
+                match router.connect_pool(pool_addr).await {
+                    Ok(connection) => connection,
+                    Err(_) => {
+                        error!("No upstream available. Retrying...");
+                        warn!("Are you using the correct TOKEN??");
+                        let mut secs = 10;
+                        while secs > 0 {
+                            tracing::warn!("Retrying in {} seconds...", secs);
+                            tokio::time::sleep(Duration::from_secs(1)).await;
+                            secs -= 1;
+                        }
+                        continue;
+                    }
+                };
 
-            share_accounter_abortable = match share_accounter::start(
-                jdc_from_translator_receiver,
-                jdc_to_translator_sender,
-                recv_from_pool,
-                send_to_pool,
+            let (downs_sv1_tx, downs_sv1_rx) = channel(10);
+            let sv1_ingress_abortable =
+                ingress::sv1_ingress::start_listen_for_downstream(downs_sv1_tx);
+
+            let (translator_up_tx, mut translator_up_rx) = channel(10);
+            let translator_abortable = match translator::start(
+                downs_sv1_rx,
+                translator_up_tx,
+                stats_sender.clone(),
+                Arc::new(router.clone()),
             )
             .await
             {
                 Ok(abortable) => abortable,
-                Err(_) => {
-                    error!("Failed to start share_accounter");
+                Err(e) => {
+                    error!("Impossible to initialize translator: {e}");
+                    // Impossible to start the proxy so we restart proxy
+                    ProxyState::update_translator_state(TranslatorState::Down);
+                    ProxyState::update_tp_state(TpState::Down);
                     return;
                 }
             };
-        };
 
-        // Collecting all abort handles
-        let mut abort_handles = vec![
-            (pool_connection_abortable, "pool_connection".to_string()),
-            (sv1_ingress_abortable, "sv1_ingress".to_string()),
-            (translator_abortable, "translator".to_string()),
-            (share_accounter_abortable, "share_accounter".to_string()),
-        ];
-        if let Some(jdc_handle) = jdc_abortable {
-            abort_handles.push((jdc_handle, "jdc".to_string()));
+            let (from_jdc_to_share_accounter_send, from_jdc_to_share_accounter_recv) = channel(10);
+            let (from_share_accounter_to_jdc_send, from_share_accounter_to_jdc_recv) = channel(10);
+            let (jdc_to_translator_sender, jdc_from_translator_receiver, _) = translator_up_rx
+                .recv()
+                .await
+                .expect("Translator failed before initialization");
+
+            let jdc_abortable: Option<AbortOnDrop>;
+            let share_accounter_abortable;
+            let tp = match TP_ADDRESS.safe_lock(|tp| tp.clone()) {
+                Ok(tp) => tp,
+                Err(e) => {
+                    error!("TP_ADDRESS Mutex Corrupted: {e}");
+                    return;
+                }
+            };
+
+            if let Some(_tp_addr) = tp {
+                jdc_abortable = jd_client::start(
+                    jdc_from_translator_receiver,
+                    jdc_to_translator_sender,
+                    from_share_accounter_to_jdc_recv,
+                    from_jdc_to_share_accounter_send,
+                )
+                .await;
+                if jdc_abortable.is_none() {
+                    ProxyState::update_tp_state(TpState::Down);
+                };
+                share_accounter_abortable = match share_accounter::start(
+                    from_jdc_to_share_accounter_recv,
+                    from_share_accounter_to_jdc_send,
+                    recv_from_pool,
+                    send_to_pool,
+                )
+                .await
+                {
+                    Ok(abortable) => abortable,
+                    Err(_) => {
+                        error!("Failed to start share_accounter");
+                        return;
+                    }
+                }
+            } else {
+                jdc_abortable = None;
+
+                share_accounter_abortable = match share_accounter::start(
+                    jdc_from_translator_receiver,
+                    jdc_to_translator_sender,
+                    recv_from_pool,
+                    send_to_pool,
+                )
+                .await
+                {
+                    Ok(abortable) => abortable,
+                    Err(_) => {
+                        error!("Failed to start share_accounter");
+                        return;
+                    }
+                };
+            };
+
+            // Collecting all abort handles
+            let mut abort_handles = vec![
+                (pool_connection_abortable, "pool_connection".to_string()),
+                (sv1_ingress_abortable, "sv1_ingress".to_string()),
+                (translator_abortable, "translator".to_string()),
+                (share_accounter_abortable, "share_accounter".to_string()),
+            ];
+            if let Some(jdc_handle) = jdc_abortable {
+                abort_handles.push((jdc_handle, "jdc".to_string()));
+            }
+            let server_handle = tokio::spawn(api::start(router.clone(), stats_sender));
+            match monitor(router, abort_handles, epsilon, server_handle).await {
+                Reconnect::NewUpstream(new_pool_addr) => {
+                    pool_addr = Some(new_pool_addr);
+                    continue;
+                }
+                Reconnect::NoUpstream => {
+                    pool_addr = None;
+                    continue;
+                }
+            }
         }
-        let server_handle = tokio::spawn(api::start(router.clone(), stats_sender));
-        match monitor(router, abort_handles, epsilon, server_handle).await {
-            Reconnect::NewUpstream(new_pool_addr) => {
-                ProxyState::update_proxy_state_up();
-                continue;
-            }
-            Reconnect::NoUpstream => {
-                ProxyState::update_proxy_state_up();
-                continue;
-            }
-        };
     }
 }
 
