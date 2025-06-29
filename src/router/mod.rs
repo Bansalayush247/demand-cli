@@ -4,7 +4,7 @@ use demand_share_accounting_ext::parser::PoolExtMessages;
 use demand_sv2_connection::noise_connection_tokio::Connection;
 use key_utils::Secp256k1PublicKey;
 use noise_sv2::Initiator;
-use roles_logic_sv2::{common_messages_sv2::SetupConnection, parsers::Mining, utils::Mutex};
+use roles_logic_sv2::{common_messages_sv2::SetupConnection, parsers::Mining};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::{
     net::SocketAddr,
@@ -55,13 +55,9 @@ impl Router {
         let (latency_tx, latency_rx) = watch::channel(None);
 
         let multi_pool_configs = Configuration::pool_configs();
-        let weighted_dist = if let Some(ref configs) = multi_pool_configs {
-            Some(Arc::new(
+        let weighted_dist = multi_pool_configs.as_ref().map(|configs| Arc::new(
                 (0..configs.len()).map(|_| AtomicU32::new(0)).collect(),
-            ))
-        } else {
-            None
-        };
+            ));
 
         Self {
             pool_addresses,
