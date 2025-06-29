@@ -31,13 +31,9 @@ use roles_logic_sv2::{
 use rand::Rng;
 use server_to_client::Notify;
 use std::{
-    
     collections::{hash_map::Entry, HashMap, VecDeque},
-   
-    net::{IpAddr,
-    SocketAddr},
+    net::{IpAddr, SocketAddr},
     sync::Arc,
-,
 };
 use sv1_api::{
     client_to_server, json_rpc, server_to_client,

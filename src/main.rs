@@ -90,7 +90,6 @@ async fn main() {
 
     if Configuration::test() {
         info!("Package is running in test mode");
-        info!("Package is running in test mode");
     }
 
     let auth_pub_k: Secp256k1PublicKey = AUTH_PUB_KEY.parse().expect("Invalid public key");
@@ -125,21 +124,6 @@ async fn initialize_proxy(
 ) {
     loop {
         let stats_sender = api::stats::StatsSender::new();
-        let (send_to_pool, recv_from_pool, pool_connection_abortable) =
-            match router.connect_pool(pool_addr).await {
-                Ok(connection) => connection,
-                Err(_) => {
-                    error!("No upstream available. Retrying in 5 seconds...");
-                    warn!(
-                        "Please make sure the your token {} is correct",
-                        Configuration::token().expect("Token is not set")
-                    );
-                    let secs = 5;
-                    tokio::time::sleep(Duration::from_secs(secs)).await;
-                    // Restart loop, esentially restarting proxy
-                    continue;
-                }
-            };
         let is_multi_upstream = router.is_multi_upstream();
 
         if is_multi_upstream {
@@ -148,7 +132,6 @@ async fn initialize_proxy(
 
             // Handle connection results
             let mut any_success = false;
-            // Start translator for pool
             let (downs_sv1_tx, downs_sv1_rx) = channel(10);
             let sv1_ingress_abortable =
                 ingress::sv1_ingress::start_listen_for_downstream(downs_sv1_tx);
@@ -169,7 +152,6 @@ async fn initialize_proxy(
                 }
             };
 
-            // Collect global abort handles ONCE
             let mut abort_handles = vec![
                 (sv1_ingress_abortable, "sv1_ingress".to_string()),
                 (translator_abortable, "translator".to_string()),
@@ -265,7 +247,7 @@ async fn initialize_proxy(
                             pool_connection_abortable,
                             format!("pool_connection_{}", pool_id),
                         ));
-                      abort_handles.push((
+                        abort_handles.push((
                             share_accounter_abortable,
                             format!("share_accounter_{}", pool_id),
                         ));
@@ -283,14 +265,15 @@ async fn initialize_proxy(
             }
 
             if !any_success {
-                error!("No upstream available. Retrying...");
-                warn!("Are you using the correct TOKEN??");
-                let mut secs = 10;
-                while secs > 0 {
-                    tracing::warn!("Retrying in {} seconds...", secs);
-                    tokio::time::sleep(Duration::from_secs(1)).await;
-                    secs -= 1;
-                }
+                error!("No upstream available. Retrying in 5 seconds...");
+                warn!(
+                    "Please make sure the your token {} is correct",
+                    Configuration::token().expect("Token is not set")
+                );
+                let secs = 5;
+                tokio::time::sleep(Duration::from_secs(secs)).await;
+                // Restart loop, esentially restarting proxy
+
                 continue;
             }
 
@@ -307,14 +290,14 @@ async fn initialize_proxy(
                 match router.connect_pool(pool_addr).await {
                     Ok(connection) => connection,
                     Err(_) => {
-                        error!("No upstream available. Retrying...");
-                        warn!("Are you using the correct TOKEN??");
-                        let mut secs = 10;
-                        while secs > 0 {
-                            tracing::warn!("Retrying in {} seconds...", secs);
-                            tokio::time::sleep(Duration::from_secs(1)).await;
-                            secs -= 1;
-                        }
+                        error!("No upstream available. Retrying in 5 seconds...");
+                        warn!(
+                            "Please make sure the your token {} is correct",
+                            Configuration::token().expect("Token is not set")
+                        );
+                        let secs = 5;
+                        tokio::time::sleep(Duration::from_secs(secs)).await;
+                        // Restart loop, esentially restarting proxy
                         continue;
                     }
                 };
@@ -416,10 +399,12 @@ async fn initialize_proxy(
             let server_handle = tokio::spawn(api::start(router.clone(), stats_sender));
             match monitor(router, abort_handles, epsilon, server_handle).await {
                 Reconnect::NewUpstream(new_pool_addr) => {
+                    ProxyState::update_proxy_state_up();
                     pool_addr = Some(new_pool_addr);
                     continue;
                 }
                 Reconnect::NoUpstream => {
+                    ProxyState::update_proxy_state_up();
                     pool_addr = None;
                     continue;
                 }
