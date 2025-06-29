@@ -1,3 +1,4 @@
+use bitcoin::hex::DisplayHex;
 use tokio::task::JoinHandle;
 
 use roles_logic_sv2::{
@@ -8,12 +9,9 @@ use roles_logic_sv2::{
     parsers::Mining,
     utils::{GroupId, Mutex},
 };
-use std::{
-    collections::VecDeque,
-    sync::{
-        atomic::{AtomicU32, Ordering},
-        Arc,
-    },
+use std::sync::{
+    atomic::{AtomicU32, Ordering},
+    Arc,
 };
 use sv1_api::{client_to_server::Submit, server_to_client, utils::HexU32Be};
 use tokio::sync::broadcast;
@@ -64,7 +62,6 @@ pub struct Bridge {
     future_jobs: Vec<NewExtendedMiningJob<'static>>,
     last_p_hash: Option<SetNewPrevHash<'static>>,
     target: Arc<Mutex<Vec<u8>>>,
-    valid_job_ids: VecDeque<u32>,
 }
 
 impl Bridge {
@@ -85,9 +82,9 @@ impl Bridge {
         tx_sv1_notify: broadcast::Sender<server_to_client::Notify<'static>>,
         extranonces: ExtendedExtranonce,
         target: Arc<Mutex<Vec<u8>>>,
-        up_id: u32,
+        channel_id: u32,
     ) -> Result<Arc<Mutex<Self>>, Error<'static>> {
-        info!("Creating new bridge for up_id {}:", up_id);
+        info!("Creating new bridge for channel_id {}:", channel_id);
         let ids = Arc::new(Mutex::new(GroupId::new()));
         let upstream_target: [u8; 32] =  target.safe_lock(|t| {
     t.clone().try_into().expect("Internal error: this operation can not fail because Vec<U8> can always be converted into [u8; 32]")
@@ -104,12 +101,11 @@ impl Bridge {
                 crate::SHARE_PER_MIN,
                 ExtendedChannelKind::Proxy { upstream_target },
                 None,
-                up_id,
+                channel_id,
             ),
             future_jobs: vec![],
             last_p_hash: None,
             target,
-            valid_job_ids: VecDeque::with_capacity(2), // Initialize with capacity for 2 jobs
         })))
     }
 
@@ -252,7 +248,11 @@ impl Bridge {
     ) -> ProxyResult<'static, ()> {
         let channel_id = share.channel_id;
         let job_id = share.share.job_id.clone();
-        info!("Bridge recv share for channel {:?}", channel_id);
+        let share_id = share.share.id;
+        info!(
+            "Bridge received share {:?} for channel {:?} and job {:?}",
+            &share_id, &channel_id, &job_id
+        );
         let (tx_sv2_submit_shares_ext, target_mutex) = self_
             .safe_lock(|s| (s.tx_sv2_submit_shares_ext.clone(), s.target.clone()))
             .map_err(|_| Error::BridgeMutexPoisoned)?;
@@ -261,12 +261,16 @@ impl Bridge {
             .map_err(|_| Error::BridgeMutexPoisoned)?
             .try_into()
             .expect("Internal error: this operation can not fail because the Vec<U8> can always be converted into Inner");
+
+        let mut dbg_target = upstream_target.clone().to_vec();
+        dbg_target.reverse();
+        debug!("Pool target: {:?}", dbg_target.as_hex());
         let mut upstream_target: Target = upstream_target.into();
         let res = self_
             .safe_lock(|s| {
                 let job_id = share.share.job_id.parse::<u32>().expect("Invalid job_id");
-                if !s.valid_job_ids.contains(&job_id) {
-                    warn!("Share rejected: job_id {} not in last two jobs", job_id);
+                if s.channel_factory.job(job_id).is_none() {
+                    warn!("Share rejected: job_id {} not in last three jobs", job_id);
                     return Err(roles_logic_sv2::Error::ShareDoNotMatchAnyJob); // rejected
                 }
                 s.channel_factory.set_target(&mut upstream_target);
@@ -291,11 +295,17 @@ impl Bridge {
                 let error_code = std::str::from_utf8(&e.error_code.to_vec()[..])
                     .unwrap_or("unparsable error code")
                     .to_string();
-                error!("Submit share error {}", error_code);
+                error!(
+                    "Submit share {} from channel {} and job {} error {}",
+                    &share_id, &channel_id, &job_id, error_code
+                );
             }
-            Ok(OnNewShare::SendSubmitShareUpstream((share, _))) => {
-                info!("SHARE MEETS UPSTREAM TARGET channel id: {}", channel_id);
-                match share {
+            Ok(OnNewShare::SendSubmitShareUpstream((s, _))) => {
+                info!(
+                    "Share with id {} meets upstream target from channel {} and job {}",
+                    &share_id, &channel_id, &job_id
+                );
+                match s {
                     Share::Extended(share) => {
                         if tx_sv2_submit_shares_ext.send(share).await.is_err() {
                             error!("Failed to send SubmitShareExtended downstream");
@@ -309,7 +319,10 @@ impl Bridge {
             // We are in an extended channel this variant is group channle only
             Ok(OnNewShare::RelaySubmitShareUpstream) => unreachable!(),
             Ok(OnNewShare::ShareMeetDownstreamTarget) => {
-                info!("SHARE MEETS DOWNSTREAM TARGET channel id {}", channel_id);
+                info!(
+                    "Share with id {} meets downstream target from channel {} and job {}",
+                    &share_id, &channel_id, &job_id
+                );
             }
             // Proxy do not have JD capabilities
             Ok(OnNewShare::ShareMeetBitcoinTarget(..)) => unreachable!(),
@@ -320,9 +333,9 @@ impl Bridge {
                     return Err(Error::RolesSv2Logic(roles_logic_sv2::Error::NoValidJob));
                 } else {
                     warn!(
-                                "Failed to translate SV1 mining.submit message to SV2 SubmitSharesExtended message, attempt {}",
-                                count
-                            );
+                        "Failed to translate SV1 mining.submit message to SV2 SubmitSharesExtended message, attempt {}",
+                        count
+                    );
                 }
             }
             Err(roles_logic_sv2::Error::ShareDoNotMatchAnyJob) => {
@@ -347,25 +360,44 @@ impl Bridge {
         version_rolling_mask: Option<HexU32Be>,
     ) -> ProxyResult<'static, SubmitSharesExtended<'static>> {
         info!(
-            "bridge translate sumbit from down channel id {}",
-            channel_id
+            "Bridge translating mining.submit {} from downstream with channel {} and job {}",
+            sv1_submit.id, channel_id, sv1_submit.job_id
         );
         let last_version = self
             .channel_factory
             .last_valid_job_version()
             .ok_or(Error::Unrecoverable)?;
-        let version = match (sv1_submit.version_bits, version_rolling_mask) {
+        debug!("Last valid job version: {}", last_version);
+        let version = match (&sv1_submit.version_bits, &version_rolling_mask) {
             // regarding version masking see https://github.com/slushpool/stratumprotocol/blob/master/stratum-extensions.mediawiki#changes-in-request-miningsubmit
-            (Some(vb), Some(mask)) => (last_version & !mask.0) | (vb.0 & mask.0),
-            (None, None) => last_version,
+            (Some(vb), Some(mask)) => {
+                debug!("Version bits and mask provided: {:?}, {:?}", vb, mask);
+                (last_version & !mask.0) | (vb.0 & mask.0)
+            }
+            (None, None) => {
+                debug!(
+                    "No version bits or mask provided, using last valid job version: {}",
+                    last_version
+                );
+                last_version
+            }
             _ => {
+                error!(
+                    "Invalid version bits {:?} or mask {:?} provided",
+                    &sv1_submit.version_bits, &version_rolling_mask
+                );
                 return Err(Error::V1Protocol(Box::new(
                     sv1_api::error::Error::InvalidSubmission,
-                )))
+                )));
             }
         };
         let mining_device_extranonce: Vec<u8> = sv1_submit.extra_nonce2.into();
+        debug!(
+            "Mining device extranonce: {}",
+            mining_device_extranonce.to_vec().as_hex()
+        );
         let extranonce2 = mining_device_extranonce;
+        debug!("Extranonce2: {}", extranonce2.to_vec().as_hex());
         Ok(SubmitSharesExtended {
             channel_id,
             // I put 0 below cause sequence_number is not what should be TODO
@@ -394,7 +426,6 @@ impl Bridge {
 
         self_
             .safe_lock(|s| {
-                s.valid_job_ids.clear();
                 s.channel_factory
                     .on_new_prev_hash(sv2_set_new_prev_hash.clone())
             })
@@ -415,7 +446,6 @@ impl Bridge {
         let mut match_a_future_job = false;
         while let Some(job) = future_jobs.pop() {
             if job.job_id == sv2_set_new_prev_hash.job_id {
-                let j_id = job.job_id;
                 // Create the mining.notify to be sent to the Downstream.
                 let notify = super::super::proxy::next_mining_notify::create_notify(
                     sv2_set_new_prev_hash.clone(),
@@ -434,7 +464,6 @@ impl Bridge {
                 self_
                     .safe_lock(|s| {
                         s.last_notify = Some(notify);
-                        s.valid_job_ids.push_back(j_id);
                     })
                     .map_err(|_| Error::BridgeMutexPoisoned)?;
                 break;
@@ -456,10 +485,10 @@ impl Bridge {
         self_: Arc<Mutex<Self>>,
         mut rx_sv2_set_new_prev_hash: tokio::sync::mpsc::Receiver<SetNewPrevHash<'static>>,
     ) -> Result<JoinHandle<()>, Error<'static>> {
+        info!("Received SV2 SetNewPrevHash messages from Pool");
         let tx_sv1_notify = self_
             .safe_lock(|s| s.tx_sv1_notify.clone())
             .map_err(|_| Error::BridgeMutexPoisoned)?;
-        debug!("Starting handle_new_prev_hash task");
         Ok(tokio::task::spawn(async move {
             loop {
                 // Receive `SetNewPrevHash` from `Upstream`
@@ -472,9 +501,13 @@ impl Bridge {
                             break;
                         }
                     };
+                let mut dbg_prev_hash = sv2_set_new_prev_hash.prev_hash.to_vec();
+                dbg_prev_hash.reverse();
                 debug!(
-                    "handle_new_prev_hash job_id: {:?}",
-                    &sv2_set_new_prev_hash.job_id
+                    "Received NewPrevHash {} for channel {} with job {}",
+                    dbg_prev_hash.as_hex(),
+                    sv2_set_new_prev_hash.channel_id,
+                    sv2_set_new_prev_hash.job_id
                 );
                 if let Err(e) = Self::handle_new_prev_hash_(
                     self_.clone(),
@@ -528,7 +561,6 @@ impl Bridge {
                 RolesLogicError::JobIsNotFutureButPrevHashNotPresent,
             ))?;
 
-            let j_id = sv2_new_extended_mining_job.job_id;
             // Create the mining.notify to be sent to the Downstream.
             // We always set to true cause we do not cache old jobs and we can not verify shares
             // for them
@@ -546,10 +578,6 @@ impl Bridge {
             self_
                 .safe_lock(|s| {
                     s.last_notify = Some(notify);
-                    s.valid_job_ids.push_back(j_id);
-                    if s.valid_job_ids.len() > 2 {
-                        s.valid_job_ids.pop_front(); // Remove oldest if more than 2
-                    }
                 })
                 .map_err(|_| Error::BridgeMutexPoisoned)?;
             Ok(())
@@ -584,10 +612,6 @@ impl Bridge {
                             break;
                         }
                     };
-                debug!(
-                    "handle_new_extended_mining_job job_id: {:?}",
-                    &sv2_new_extended_mining_job.job_id
-                );
                 if let Err(e) = Self::handle_new_extended_mining_job_(
                     self_.clone(),
                     sv2_new_extended_mining_job,

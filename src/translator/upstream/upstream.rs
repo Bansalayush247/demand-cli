@@ -300,6 +300,7 @@ impl Upstream {
                                     };
                                 }
                                 Mining::NewExtendedMiningJob(m) => {
+                                    info!("Parsing incoming NewExtendedMiningJob message from Pool for Channel Id: {}", m.channel_id);
                                     let job_id = m.job_id;
 
                                     if let Err(e) = self_.safe_lock(|s| {
@@ -507,20 +508,32 @@ impl ParseUpstreamMiningMessages<Downstream, NullDownstreamMiningSelector, NoRou
         &mut self,
         m: roles_logic_sv2::mining_sv2::OpenExtendedMiningChannelSuccess,
     ) -> Result<SendTo<Downstream>, RolesLogicError> {
+        info!(
+            "Handling OpenExtendedMiningChannelSuccess message from Pool for Channel Id: {}",
+            m.channel_id
+        );
         let tproxy_e1_len =
             proxy_extranonce1_len(m.extranonce_size as usize, self.min_extranonce_size.into())
                 as u16;
         if self.min_extranonce_size + tproxy_e1_len < m.extranonce_size {
+            error!(
+                "Invalid extranonce size for Channel Id {}: expected at least {} but got {}",
+                m.channel_id,
+                self.min_extranonce_size + tproxy_e1_len,
+                m.extranonce_size
+            );
             return Err(RolesLogicError::InvalidExtranonceSize(
                 self.min_extranonce_size,
                 m.extranonce_size,
             ));
         }
+        info!(
+            "Extended Channel with Channel Id {} has Target: {:?}",
+            m.channel_id, m.target
+        );
         self.target
             .safe_lock(|t| *t = m.target.to_vec())
             .map_err(|e| RolesLogicError::PoisonLock(e.to_string()))?;
-
-        info!("Up: Successfully Opened Extended Mining Channel");
         self.channel_id = Some(m.channel_id);
         self.extranonce_prefix = Some(m.extranonce_prefix.to_vec());
         let m = Mining::OpenExtendedMiningChannelSuccess(m.into_static());
@@ -649,9 +662,7 @@ impl ParseUpstreamMiningMessages<Downstream, NullDownstreamMiningSelector, NoRou
         &mut self,
         m: roles_logic_sv2::mining_sv2::SetTarget,
     ) -> Result<roles_logic_sv2::handlers::mining::SendTo<Downstream>, RolesLogicError> {
-        info!("SetTarget: {:?}", m);
         let m = m.into_static();
-
         self.target
             .safe_lock(|t| *t = m.maximum_target.to_vec())
             .map_err(|e| RolesLogicError::PoisonLock(e.to_string()))?;

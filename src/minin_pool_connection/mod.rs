@@ -44,7 +44,10 @@ pub async fn connect_pool(
 > {
     let socket = loop {
         match TcpStream::connect(address).await {
-            Ok(socket) => break socket,
+            Ok(socket) => {
+                info!("Socket initialized with Pool at {}", address);
+                break socket;
+            }
             Err(e) => {
                 error!(
                     "Failed to connect to Upstream role at {}, retrying in 5s: {}",
@@ -55,14 +58,9 @@ pub async fn connect_pool(
         }
     };
 
+    info!("Performing SV2 Handshake with Pool at {}", address);
     let initiator =
         Initiator::from_raw_k(authority_public_key.into_bytes()).expect("Invalid authority key");
-
-    info!(
-        "PROXY SERVER - ACCEPTING FROM UPSTREAM: {}",
-        socket.peer_addr().expect("Failed to get peer address")
-    );
-
     // Channel to send and receive messages to the SV2 Upstream role
     let (mut receiver, mut sender, _, _) =
         Connection::new(socket, HandshakeRole::Initiator(initiator))
@@ -71,6 +69,8 @@ pub async fn connect_pool(
                 error!("Failed to create connection");
                 Error::SV2Connection(e)
             })?;
+    info!("SV2 Handshake with Pool at {} completed", address);
+    info!("Sending SetupConnection message to Pool at {}", address);
     let setup_connection_msg =
         setup_connection_msg.unwrap_or(get_mining_setup_connection_msg(true));
     match mining_setup_connection(

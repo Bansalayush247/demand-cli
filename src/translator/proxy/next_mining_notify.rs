@@ -1,3 +1,4 @@
+use bitcoin::hex::DisplayHex;
 use roles_logic_sv2::{
     job_creator::extended_job_to_non_segwit,
     mining_sv2::{NewExtendedMiningJob, SetNewPrevHash},
@@ -6,7 +7,7 @@ use sv1_api::{
     server_to_client,
     utils::{HexU32Be, MerkleNode, PrevHash},
 };
-use tracing::debug;
+use tracing::info;
 
 /// Creates a new SV1 `mining.notify` message if both SV2 `SetNewPrevHash` and
 /// `NewExtendedMiningJob` messages have been received. If one of these messages is still being
@@ -53,6 +54,14 @@ pub fn create_notify(
         time,
         clean_jobs,
     };
-    debug!("\nNextMiningNotify: {:?}\n", notify_response);
+    // Todo find a nice way to print prev_hash, cb1,cb2  as hex
+    let mut dbg_prev_hash = notify_response.prev_hash.0.to_vec();
+    dbg_prev_hash.reverse();
+    info!(
+        "NextMiningNotify created for channel id: {:?}, Job id: {:?}, PrevHash: {:?} version: {:?}, bits: {:?}, time: {:?}, clean_jobs: {}",
+        new_job.channel_id,
+        notify_response.job_id, dbg_prev_hash.as_hex(), notify_response.version, notify_response.bits, notify_response.time,
+        notify_response.clean_jobs
+    );
     notify_response
 }

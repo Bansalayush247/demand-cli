@@ -1,4 +1,4 @@
-use std::net::{IpAddr, SocketAddr};
+use std::{net::{IpAddr, SocketAddr}, sync::Arc};
 
 use crate::{
     config::Configuration,
@@ -8,6 +8,7 @@ use futures::{
     stream::{SplitSink, SplitStream},
     SinkExt, StreamExt,
 };
+use roles_logic_sv2::utils::Mutex;
 use tokio::{
     net::{TcpListener, TcpStream},
     sync::mpsc::{channel, Receiver, Sender},
@@ -18,13 +19,20 @@ use tracing::{error, info, warn};
 pub fn start_listen_for_downstream(
     downstreams: Sender<(Sender<String>, Receiver<String>, IpAddr)>,
 ) -> AbortOnDrop {
-    info!("Starting downstream listner");
     tokio::task::spawn(async move {
         let down_addr: String = crate::SV1_DOWN_LISTEN_ADDR.to_string();
         let downstream_addr: SocketAddr = down_addr.parse().expect("Invalid listen address");
+        info!(
+            "Trying to bind to address {} for downstream(miner) connections",
+            downstream_addr
+        );
         let downstream_listener = TcpListener::bind(downstream_addr)
             .await
             .expect("impossible to bind downstream");
+        info!(
+            "Listening for downstream connections on {:?}",
+            downstream_addr
+        );
         while let Ok((stream, addr)) = downstream_listener.accept().await {
             info!("Try to connect {:#?}", addr);
             Downstream::initialize(
@@ -65,9 +73,10 @@ impl Downstream {
         sender: Sender<String>,
     ) {
         let (writer, reader) = framed.split();
+        let firmware = Arc::new(Mutex::new(Firmware::Uninitialized));
         let result = tokio::select! {
-            result1 = Self::receive_from_downstream_and_relay_up(reader, sender) => result1,
-            result2 = Self::receive_from_upstream_and_relay_down(writer, receiver) => result2,
+            result1 = Self::receive_from_downstream_and_relay_up(reader, sender, firmware.clone()) => result1,
+            result2 = Self::receive_from_upstream_and_relay_down(writer, receiver, firmware.clone()) => result2,
         };
         // upstream disconnected make sure to clean everything before exit
         match result {
@@ -79,11 +88,23 @@ impl Downstream {
     async fn receive_from_downstream_and_relay_up(
         mut recv: SplitStream<Framed<TcpStream, LinesCodec>>,
         send: Sender<String>,
+        firmware: Arc<Mutex<Firmware>>,
     ) -> Sv1IngressError {
+        let mut is_subscribed = false;
         let task = tokio::spawn(async move {
             while let Some(Ok(message)) = recv.next().await {
                 if Configuration::sv1_ingress_log() {
                     info!("Sending msg to upstream: {}", message);
+                }
+                if ! is_subscribed {
+                    if message.contains("mining.subscribe") {
+                        is_subscribed = true;
+                        if message.contains("LUXminer") {
+                            firmware.safe_lock(|f| *f = Firmware::Luxor).unwrap();
+                        } else {
+                            firmware.safe_lock(|f| *f = Firmware::Other).unwrap();
+                        }
+                    }
                 }
                 if send.send(message).await.is_err() {
                     error!("Upstream dropped trying to send");
@@ -102,12 +123,21 @@ impl Downstream {
     async fn receive_from_upstream_and_relay_down(
         mut send: SplitSink<Framed<TcpStream, LinesCodec>, String>,
         mut recv: Receiver<String>,
+        firmware_: Arc<Mutex<Firmware>>,
     ) -> Sv1IngressError {
+        let mut firmware = Firmware::Uninitialized;
         let task = tokio::spawn(async move {
             while let Some(message) = recv.recv().await {
-                let message = message.replace(['\n', '\r'], "");
+                let mut message = message.replace(['\n', '\r'], "");
+                if !firmware.is_initialized() {
+                    firmware = firmware_.safe_lock(|f| *f).unwrap();
+                } else if firmware.is_luxor() && !message.contains("\"id\"") {
+                    if let Some(pos) = message.find('{') {
+                        message.insert_str(pos + 1, r#""id":null,"#);
+                    }
+                }
                 if Configuration::sv1_ingress_log() {
-                    info!("Sending msg to downstream: {}", message);
+                    info!("Sending msg to downstream_: {}", message);
                 }
                 if send.send(message).await.is_err() {
                     warn!("Downstream dropped while trying to send message down");
@@ -125,5 +155,21 @@ impl Downstream {
             Ok(err) => err,
             Err(_) => Sv1IngressError::TaskFailed,
         }
+    }
+}
+
+#[derive(Debug,Clone,Copy)]
+enum Firmware {
+    Luxor,
+    Other,
+    Uninitialized,
+}
+
+impl Firmware {
+    fn is_initialized(&self) -> bool {
+        !matches!(self, Firmware::Uninitialized)
+    }
+    fn is_luxor(&self) -> bool {
+        matches!(self, Firmware::Luxor)
     }
 }

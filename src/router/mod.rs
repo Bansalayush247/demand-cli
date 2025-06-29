@@ -162,11 +162,10 @@ impl Router {
             return Some(self.pool_addresses[0]);
         }
         if let Some((pool, latency)) = self.select_pool().await {
-            info!("Latency for upstream {:?} is {:?}", pool, latency);
+            info!("Latency for Pool {:?} is {:?}", pool, latency);
             self.latency_tx.send_replace(Some(latency)); // update latency
             Some(pool)
         } else {
-            //info!("No available pool");
             None
         }
     }
@@ -228,7 +227,7 @@ impl Router {
         };
         self.current_pool = Some(pool);
 
-        info!("Upstream {:?} selected", pool);
+        info!("Trying to connect to Pool {:?}", pool);
 
         match minin_pool_connection::connect_pool(
             pool,
@@ -247,6 +246,10 @@ impl Router {
                         error!("Pool address Mutex corrupt");
                         crate::proxy_state::ProxyState::update_inconsistency(Some(1));
                     });
+                info!(
+                    "Completed Handshake And SetupConnection with Pool at {:?}",
+                    pool
+                );
 
                 Ok((send_to_pool, recv_from_pool, pool_connection_abortable))
             }

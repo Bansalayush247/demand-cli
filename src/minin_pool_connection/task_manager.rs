@@ -3,7 +3,7 @@ use std::sync::Arc;
 use crate::shared::utils::AbortOnDrop;
 use roles_logic_sv2::utils::Mutex;
 use tokio::sync::mpsc;
-use tracing::warn;
+use tracing::debug;
 
 #[derive(Debug)]
 #[allow(dead_code)]
@@ -25,11 +25,11 @@ impl TaskManager {
             while let Some(task) = receiver.recv().await {
                 tasks.push(task);
             }
-            warn!("Ingress task manager stopped, keep alive tasks");
             loop {
                 tokio::time::sleep(std::time::Duration::from_secs(1000)).await;
             }
         });
+        debug!("Mining Pool Task Manager initialized");
         Arc::new(Mutex::new(Self {
             send_task: sender,
             abort: Some(handle.into()),

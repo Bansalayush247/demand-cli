@@ -99,34 +99,24 @@ pub fn allow_submit_share() -> crate::translator::error::ProxyResult<'static, bo
 
 pub fn validate_share(
     request: &client_to_server::Submit<'static>,
-    recent_notifies: &VecDeque<Notify<'static>>,
+    job: &Notify<'static>,
     difficulties: &VecDeque<f32>,
     extranonce1: Vec<u8>,
     version_rolling_mask: Option<sv1_api::utils::HexU32Be>,
 ) -> Option<f32> {
-    let recent_notifies = recent_notifies.clone();
-    let matching_job = recent_notifies
-        .iter()
-        .find(|notify| notify.job_id == request.job_id);
+    info!(
+        "Validating share from request {} and job {}",
+        request.id, request.job_id
+    );
 
-    let job = match matching_job {
-        Some(job) => job,
-        None => {
-            error!(
-                "Share rejected: Job ID {} not found in recent notify msgs",
-                request.job_id
-            );
+    let prev_hash_vec: Vec<u8> = job.prev_hash.clone().into();
+    let prev_hash = match binary_sv2::U256::from_vec_(prev_hash_vec) {
+        Ok(hash) => hash,
+        Err(e) => {
+            error!("Share rejected: Invalid previous hash: {:?}", e);
             return None;
         }
     };
-    // Check job ID match
-    if request.job_id != job.job_id {
-        error!("Share rejected: Job ID mismatch");
-        return None;
-    }
-
-    let prev_hash_vec: Vec<u8> = job.prev_hash.clone().into();
-    let prev_hash = binary_sv2::U256::from_vec_(prev_hash_vec).unwrap();
     let mut merkle_branch = Vec::new();
     for branch in &job.merkle_branch {
         merkle_branch.push(branch.0.to_vec());
@@ -159,8 +149,9 @@ pub fn validate_share(
     );
 
     hash.reverse(); //convert to little-endian
-    info!("Hash: {:?}", hash.to_vec().as_hex());
+    info!("Share Hash: {:?}", hash.to_vec().as_hex());
     // Check against difficulties from latest to earliest
+    // TODO: This is not a sound check - We should check against the difficulty of the specific job
     for &difficulty in difficulties.iter().rev() {
         let target = Downstream::difficulty_to_target(difficulty);
         debug!(
@@ -169,7 +160,7 @@ pub fn validate_share(
             target.to_vec().as_hex()
         );
         if hash <= target {
-            info!("Target: {:?}", target.to_vec().as_hex());
+            info!("Share met Target: {:?}", target.to_vec().as_hex());
             return Some(difficulty); // Return the difficulty met
         }
     }
