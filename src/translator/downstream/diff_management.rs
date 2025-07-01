@@ -63,8 +63,7 @@ impl Downstream {
         self_: &Arc<Mutex<Self>>,
         router: Option<Arc<crate::router::Router>>,
     ) -> ProxyResult<'static, ()> {
-        let (upstream_diff, estimated_downstream_hash_rate, assigned_pool, connection_id) =
-            self_.safe_lock(|d| {
+        let (upstream_diff, estimated_downstream_hash_rate, assigned_pool, connection_id) = self_.safe_lock(|d| {
                 (
                     d.upstream_difficulty_config.clone(),
                     d.difficulty_mgmt.estimated_downstream_hash_rate,
@@ -84,7 +83,7 @@ impl Downstream {
                     router.remove_miner_from_pool(pool_addr).await;
                 });
                 info!(
-                    "✅ REMOVED: Miner {} disconnected from pool {}",
+                    "REMOVED: Miner {} disconnected from pool {}",
                     connection_id, pool_addr
                 );
             }

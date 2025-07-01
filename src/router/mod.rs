@@ -145,7 +145,7 @@ impl Router {
 
     /// Select the best pool for connection
     pub async fn select_pool_connect(&self) -> Option<SocketAddr> {
-        info!("Selecting the best upstream ");
+        info!("Selecting best Pool for connection");
         if self.pool_addresses.is_empty() {
             error!("No pool addresses provided");
             return None;
@@ -166,7 +166,7 @@ impl Router {
         }
     }
 
-    /// Select the best pool for monitoringo
+    /// Select the best pool for monitoring
     async fn select_pool_monitor(&self, epsilon: Duration) -> Option<SocketAddr> {
         if let Some((best_pool, best_pool_latency)) = self.select_pool().await {
             if let Some(current_pool) = self.current_pool {
@@ -319,7 +319,7 @@ impl Router {
         }
         if let Some(best_pool) = self.select_pool_monitor(epsilon).await {
             if Some(best_pool) != self.current_pool {
-                info!("Switching to faster upstream {:?}", best_pool);
+                info!("Switching to faster upstreamn {:?}", best_pool);
                 return Some(best_pool);
             } else {
                 return None;
@@ -454,9 +454,9 @@ impl PoolLatency {
                         let relay_down_task =
                             minin_pool_connection::relay_down(receiver, send_to_down);
 
+                        let timer = Instant::now();
                         let mut received_new_job = false;
                         let mut received_prev_hash = false;
-                        let timer = Instant::now();
 
                         while let Some(message) = recv_from_down.recv().await {
                             if let PoolExtMessages::Mining(Mining::NewExtendedMiningJob(

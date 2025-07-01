@@ -128,6 +128,7 @@ pub async fn start_notify(
             }
             // TODO here we want to be sure that on drop this is called
             let _ = Downstream::remove_downstream_hashrate_from_channel(&downstream, Some(router));
+            // TODO here we want to kill the tasks
             warn!(
                 "Downstream: Shutting down sv1 downstream job notifier for {}",
                 &host

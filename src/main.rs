@@ -80,7 +80,7 @@ async fn main() {
 
     Configuration::token().expect("TOKEN is not set");
 
-    // `self_update` performs synchronous I/O so spawn_blocking is needed
+    //`self_update` performs synchronous I/O so spawn_blocking is needed
     if Configuration::auto_update() {
         if let Err(e) = tokio::task::spawn_blocking(check_update_proxy).await {
             error!("An error occured while trying to update Proxy; {:?}", e);
