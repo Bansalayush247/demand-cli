@@ -1,3 +1,8 @@
+use std::{
+    net::SocketAddr,
+    time::{Duration, Instant},
+};
+
 use crate::jd_client::job_declarator::{setup_connection::SetupConnectionHandler, JobDeclarator};
 use codec_sv2::{buffer_sv2::Slice, HandshakeRole};
 use demand_share_accounting_ext::parser::PoolExtMessages;
@@ -6,10 +11,7 @@ use key_utils::Secp256k1PublicKey;
 use noise_sv2::Initiator;
 use roles_logic_sv2::{common_messages_sv2::SetupConnection, parsers::Mining};
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::{
-    net::SocketAddr,
-    time::{Duration, Instant},
-};
+
 use tokio::{
     net::TcpStream,
     sync::{
@@ -24,6 +26,7 @@ use crate::{
     minin_pool_connection::{self, get_mining_setup_connection_msg, mining_setup_connection},
     shared::utils::AbortOnDrop,
 };
+
 /// Router handles connection to Multiple upstreams.
 use std::sync::Arc;
 
