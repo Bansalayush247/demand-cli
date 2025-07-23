@@ -453,9 +453,9 @@ impl PoolLatency {
                             return Err(());
                         }
 
-                        let relay_up_task = minin_pool_connection::relay_up(recv_to_up, sender);
+                        let relay_up_task = minin_pool_connection::relay_up(recv_to_up, sender, self.pool);
                         let relay_down_task =
-                            minin_pool_connection::relay_down(receiver, send_to_down);
+                            minin_pool_connection::relay_down(receiver, send_to_down, self.pool);
 
                         let timer = Instant::now();
                         let mut received_new_job = false;
