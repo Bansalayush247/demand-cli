@@ -86,6 +86,8 @@ pub struct Upstream {
     // than the configured percentage
     pub(super) difficulty_config: Arc<Mutex<UpstreamDifficultyConfig>>,
     pub sender: TSender<Mining<'static>>,
+    /// The address of the pool, used for logging and debugging purposes.
+    pub pool_address: std::net::SocketAddr,
 }
 
 impl PartialEq for Upstream {
@@ -109,6 +111,7 @@ impl Upstream {
         target: Arc<Mutex<Vec<u8>>>,
         difficulty_config: Arc<Mutex<UpstreamDifficultyConfig>>,
         sender: TSender<Mining<'static>>,
+        pool_address: std::net::SocketAddr,
     ) -> ProxyResult<'static, Arc<Mutex<Self>>> {
         Ok(Arc::new(Mutex::new(Self {
             extranonce_prefix: None,
@@ -123,6 +126,7 @@ impl Upstream {
             target,
             difficulty_config,
             sender,
+            pool_address,
         })))
     }
 
@@ -300,7 +304,14 @@ impl Upstream {
                                     };
                                 }
                                 Mining::NewExtendedMiningJob(m) => {
-                                    info!("Parsing incoming NewExtendedMiningJob message from Pool for Channel Id: {}", m.channel_id);
+                                    let pool_address = match self_.safe_lock(|s| s.pool_address) {
+                                        Ok(addr) => addr,
+                                        Err(e) => {
+                                            error!("Translator upstream mutex poisoned: {e}");
+                                            return;
+                                        }
+                                    };
+                                    info!("Parsing incoming NewExtendedMiningJob message from Pool {} for Channel Id: {}", pool_address, m.channel_id);
                                     let job_id = m.job_id;
 
                                     if let Err(e) = self_.safe_lock(|s| {

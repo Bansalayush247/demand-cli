@@ -35,6 +35,8 @@ pub async fn start(
         Option<Address>,
     )>,
     stats_sender: crate::api::stats::StatsSender,
+    router: Arc<crate::router::Router>,
+    pool_address: std::net::SocketAddr,
 ) -> Result<AbortOnDrop, Error<'static>> {
     let task_manager = TaskManager::initialize(pool_connection.clone());
     let abortable = task_manager
@@ -102,6 +104,7 @@ pub async fn start(
         target.clone(),
         diff_config.clone(),
         send_to_up,
+        pool_address, 
     )
     .await?;
 
@@ -176,6 +179,7 @@ pub async fn start(
                 diff_config,
                 downstreams,
                 stats_sender,
+                router,
             )
             .await
             {

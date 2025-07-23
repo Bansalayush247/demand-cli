@@ -24,6 +24,7 @@ pub async fn start_accept_connection(
     upstream_difficulty_config: Arc<Mutex<UpstreamDifficultyConfig>>,
     mut downstreams: Receiver<(Sender<String>, Receiver<String>, IpAddr)>,
     stats_sender: crate::api::stats::StatsSender,
+    router: Arc<crate::router::Router>,
 ) -> Result<(), Error<'static>> {
     let handle = {
         let task_manager = task_manager.clone();
@@ -70,6 +71,7 @@ pub async fn start_accept_connection(
                         break;
                     }
                 };
+
                 let open_sv1_downstream =
                     match bridge.safe_lock(|s| s.on_new_sv1_connection(expected_hash_rate)) {
                         Ok(sv1_downstream) => sv1_downstream,
@@ -99,6 +101,7 @@ pub async fn start_accept_connection(
                             task_manager.clone(),
                             initial_difficulty,
                             stats_sender.clone(),
+                            router.clone(),
                         )
                         .await
                     }
